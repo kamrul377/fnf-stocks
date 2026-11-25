@@ -1,0 +1,72 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data; }
+    function active() { return signedIn() && exists(/databases/$(db)/documents/users/$(request.auth.uid)) && me().active == true; }
+    function role() { return me().role; }
+    function perms() { return get(/databases/$(db)/documents/settings/role_permissions).data; }
+    function can(p) {
+      return active() && (role() == 'admin' ||
+        (exists(/databases/$(db)/documents/settings/role_permissions) && perms()[role()][p] == true));
+    }
+    function bootstrapped() { return exists(/databases/$(db)/documents/settings/bootstrap); }
+
+    match /settings/bootstrap {
+      allow read: if true;
+      allow create: if signedIn() && !bootstrapped();
+    }
+    match /settings/role_permissions {
+      allow read: if active();
+      allow write: if active() && role() == 'admin';      // managers: view only
+    }
+    match /settings/{other} { allow read: if active(); allow write: if active() && role() == 'admin'; }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || can('can_create_users') || role() in ['admin','manager']);
+      // first admin bootstrap (batch also creates settings/bootstrap)
+      allow create: if signedIn() && request.auth.uid == uid && request.resource.data.role == 'admin'
+                    && !bootstrapped() && existsAfter(/databases/$(db)/documents/settings/bootstrap);
+      // staff creation, scoped by hierarchy
+      allow create: if can('can_create_users') &&
+        ((role() == 'admin' && request.resource.data.role in ['manager','noc','support','technician']) ||
+         (role() == 'manager' && request.resource.data.role in ['support','technician']));
+      allow update: if active() && (
+        role() == 'admin' ||
+        (role() == 'manager' && resource.data.role in ['support','technician'] && request.resource.data.role == resource.data.role));
+      allow delete: if false;
+    }
+
+    match /items/{id} {
+      allow read: if active();
+      allow create, delete: if can('can_create_edit_items');
+      // stock counters may change via services (purchase / issue / return)
+      allow update: if can('can_create_edit_items') || can('can_record_purchase') || can('can_direct_withdraw')
+                    || can('can_approve_requests') || can('can_manage_rma_returns');
+    }
+    match /serials/{sn} {
+      allow read: if active();
+      allow create: if can('can_record_purchase');
+      allow update: if can('can_direct_withdraw') || can('can_approve_requests') || can('can_manage_rma_returns');
+    }
+    match /drums/{id} {
+      allow read: if active();
+      allow create: if can('can_record_purchase');
+      allow update: if can('can_direct_withdraw') || can('can_approve_requests');
+    }
+    match /suppliers/{id} { allow read: if active(); allow write: if can('can_manage_suppliers'); }
+
+    match /requisitions/{id} {
+      allow read: if active() && (resource.data.requested_by == request.auth.uid || can('can_approve_requests') || can('can_view_full_ledger'));
+      allow create: if can('can_request_stock') && request.resource.data.requested_by == request.auth.uid
+                    && request.resource.data.status == 'PENDING';
+      allow update: if can('can_approve_requests') && resource.data.status == 'PENDING';
+      allow delete: if false;
+    }
+    match /transactions/{id} {
+      allow read: if can('can_view_full_ledger') || (active() && resource.data.by == request.auth.uid);
+      allow create: if active() && request.resource.data.by == request.auth.uid;
+      allow update, delete: if false;   // immutable audit log (even for admin)
+    }
+  }
+}
