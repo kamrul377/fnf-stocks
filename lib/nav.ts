@@ -8,6 +8,7 @@ export const NAV: { href: string; label: string; perm?: PermissionKey; anyOf?: P
   { href: "/purchases", label: "Purchases / Stock-In", perm: "can_record_purchase" },
   { href: "/withdraw", label: "Direct Withdraw", perm: "can_direct_withdraw" },
   { href: "/devices", label: "Serial & MAC Tracker" },
+    { href: "/returns", label: "Receive from Field", perm: "can_manage_rma_returns" },
   { href: "/rma", label: "Returns & RMA", perm: "can_manage_rma_returns" },
   { href: "/ledger", label: "Stock Ledger", perm: "can_view_full_ledger" },
   { href: "/users", label: "Staff", perm: "can_create_users" },

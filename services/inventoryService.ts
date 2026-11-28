@@ -1,10 +1,11 @@
 import { doc, collection, runTransaction, Transaction } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { DeviceSerial, DeviceStatus, Drum, InventoryItem, Requisition, StockTransaction, UserProfile } from "@/types/inventory";
+import { ClientFiber, DeviceSerial, DeviceStatus, Drum, InventoryItem, Requisition, StockTransaction, UserProfile } from "@/types/inventory";
 
 const itemRef = (id: string) => doc(db, "items", id);
 const serialRef = (sn: string) => doc(db, "serials", sn.trim().toUpperCase());
 const drumRef = (id: string) => doc(db, "drums", id);
+const cfRef = (client: string, itemId: string) => doc(db, "client_fiber", `${client.trim().replace(/\//g, "_")}__${itemId}`);
 const clean = <T,>(o: T) => JSON.parse(JSON.stringify(o)) as T; // strips undefined
 
 function logTx(t: Transaction, u: UserProfile, p: Omit<StockTransaction, "by" | "by_name" | "at">) {
@@ -61,11 +62,11 @@ export async function recordPurchase(u: UserProfile, p: PurchaseInput) {
 
 /* ---------- ISSUE (shared by direct withdraw + requisition fulfilment) ---------- */
 export interface IssueLine { item_id: string; qty: number; serials?: string[]; drum_id?: string; }
-export interface IssueTarget { status: DeviceStatus; reference: string; }
+export interface IssueTarget { status: DeviceStatus; reference: string; note?: string; }
 
 /** Phase 1: every read. Phase 2: every write (Firestore requires reads first). */
 async function issueLines(t: Transaction, u: UserProfile, lines: IssueLine[], tg: IssueTarget, type: "WITHDRAW" | "REQUEST_FULFILLED") {
-  const loaded: { item: InventoryItem; sn?: string[]; cur?: DeviceSerial[]; drum?: Drum }[] = [];
+  const loaded: { item: InventoryItem; sn?: string[]; cur?: DeviceSerial[]; drum?: Drum; cf?: ClientFiber }[] = [];
   for (const l of lines) {
     const item = (await t.get(itemRef(l.item_id))).data() as InventoryItem | undefined;
     if (!item) throw new Error("Item not found");
@@ -83,16 +84,23 @@ async function issueLines(t: Transaction, u: UserProfile, lines: IssueLine[], tg
       const drum = (await t.get(drumRef(l.drum_id))).data() as Drum | undefined;
       if (!drum || drum.item_id !== item.id) throw new Error("Invalid drum");
       if (drum.remaining_length < l.qty) throw new Error(`${item.name}: drum ${drum.id} has only ${drum.remaining_length} left`);
-      loaded.push({ item, drum });
+      const cf = tg.status === "ASSIGNED_CLIENT"
+        ? (await t.get(cfRef(tg.reference, item.id))).data() as ClientFiber | undefined : undefined;
+      loaded.push({ item, drum, cf });
     } else loaded.push({ item });
   }
   lines.forEach((l, i) => {
-    const { item, sn, cur, drum } = loaded[i];
+    const { item, sn, cur, drum, cf } = loaded[i];
     sn?.forEach((s, k) => t.update(serialRef(s), { status: tg.status, holder_ref: tg.reference,
       history: [...cur![k].history, { at: Date.now(), status: tg.status, ref: tg.reference, by: u.uid }] }));
-    if (drum) t.update(drumRef(drum.id), { remaining_length: drum.remaining_length - l.qty });
+    if (drum) {
+      t.update(drumRef(drum.id), { remaining_length: drum.remaining_length - l.qty });
+      if (tg.status === "ASSIGNED_CLIENT") t.set(cfRef(tg.reference, item.id), clean({
+        client_id: tg.reference.trim(), item_id: item.id, item_name: item.name,
+        issued: (cf?.issued ?? 0) + l.qty, recovered: cf?.recovered ?? 0, lost: cf?.lost ?? 0, updated_at: Date.now() }));
+    }
     t.update(itemRef(item.id), { current_stock: item.current_stock - l.qty });
-    logTx(t, u, { type, item_id: item.id, item_name: item.name, qty: -l.qty, serials: sn, drum_id: drum?.id, reference: tg.reference });
+    logTx(t, u, { type, item_id: item.id, item_name: item.name, qty: -l.qty, serials: sn, drum_id: drum?.id, reference: tg.reference, note: tg.note });
   });
 }
 
@@ -146,7 +154,30 @@ export async function returnDevice(u: UserProfile, serial: string, as: "RETURNED
   });
 }
 
+/* ---------- FIBER RECOVERY (client disconnect) ---------- */
+export async function recoverFiber(u: UserProfile, client: string, itemId: string, length: number, note = "") {
+  if (!(length >= 0)) throw new Error("Enter a valid length");
+  return runTransaction(db, async t => {
+    const cRef = cfRef(client, itemId);
+    const cf = (await t.get(cRef)).data() as ClientFiber | undefined;
+    if (!cf) throw new Error("No fiber was issued to this client");
+    const outstanding = cf.issued - cf.recovered - cf.lost;
+    if (outstanding <= 0) throw new Error("Nothing outstanding for this client");
+    if (length > outstanding) throw new Error(`Cannot recover more than ${outstanding} m`);
+    const item = (await t.get(itemRef(itemId))).data() as InventoryItem;
+    const loss = outstanding - length;
+    const drumId = `RET-${client.trim().replace(/[\/\s]/g, "_")}-${Date.now().toString(36).toUpperCase()}`;
+    if (length > 0) {
+      t.set(drumRef(drumId), { id: drumId, item_id: itemId, initial_length: length, remaining_length: length });
+      t.update(itemRef(itemId), { current_stock: item.current_stock + length });
+    }
+    t.update(cRef, { recovered: cf.recovered + length, lost: cf.lost + loss, updated_at: Date.now(), last_note: note });
+    logTx(t, u, { type: "RETURN", item_id: itemId, item_name: item.name, qty: length, drum_id: length > 0 ? drumId : undefined,
+      reference: client.trim(), note: `Fiber recovered ${length} m of ${outstanding} m, loss ${loss} m. ${note}` });
+  });
+}
 
+/* ---------- ADMIN DELETE (keeps item stock counters accurate) ---------- */
 export async function deleteSerial(sn: string) {
   return runTransaction(db, async t => {
     const sRef = serialRef(sn), d = (await t.get(sRef)).data() as DeviceSerial | undefined;
@@ -164,5 +195,24 @@ export async function deleteDrum(id: string) {
     const item = (await t.get(itemRef(d.item_id))).data() as InventoryItem | undefined;
     if (item) t.update(itemRef(item.id), { current_stock: Math.max(0, item.current_stock - d.remaining_length) });
     t.delete(dRef);
+  });
+}
+/* ---------- RECEIVE DEVICE FROM FIELD ---------- */
+export async function receiveDevice(u: UserProfile, serial: string, condition: "GOOD" | "FAULTY", fromLabel = "", note = "") {
+  return runTransaction(db, async t => {
+    const sRef = serialRef(serial), d = (await t.get(sRef)).data() as DeviceSerial | undefined;
+    if (!d) throw new Error(`Serial not found: ${serial}`);
+    if (!["ASSIGNED_CLIENT", "ASSIGNED_POP", "WITH_TECHNICIAN"].includes(d.status))
+      throw new Error(`${d.serial_number} is not in the field (status: ${d.status})`);
+    const item = (await t.get(itemRef(d.item_id))).data() as InventoryItem;
+    const from = fromLabel || d.holder_ref || "";
+    const where = d.status === "ASSIGNED_CLIENT" ? "client" : d.status === "ASSIGNED_POP" ? "POP" : "staff";
+    const next: DeviceStatus = condition === "GOOD" ? "RETURNED_USED" : "FAULTY_RMA";
+    t.update(sRef, { status: next, holder_ref: "",
+      history: [...d.history, { at: Date.now(), status: next, ref: `Received from ${where} ${from}${note ? ` · ${note}` : ""}`, by: u.uid }] });
+    if (condition === "GOOD") t.update(itemRef(item.id), { current_stock: item.current_stock + 1 });
+    logTx(t, u, { type: "RETURN", item_id: item.id, item_name: item.name, qty: condition === "GOOD" ? 1 : 0,
+      serials: [d.serial_number], reference: from,
+      note: `Received from ${where} ${from}: ${condition === "GOOD" ? "good, back in stock" : "faulty, sent to RMA"}${note ? `. ${note}` : ""}` });
   });
 }
